@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PDF Reader Exporter</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <p class="eyebrow">PDF Reader</p>
+      <h1>Upload a shipment PDF and export totals right in your browser.</h1>
+      <p class="subcopy">
+        This GitHub Pages version runs fully client-side. It OCRs each page in the browser, totals quantity shipped by part number, builds an Excel workbook with PO-level detail, and lets you choose where to save the ZIP.
+      </p>
+    </section>
+
+    <section class="content">
+      <div class="panel">
+        <form id="upload-form">
+          <label class="dropzone" id="dropzone" for="pdf-file">
+            <strong>Select or drop a PDF report</strong>
+            <p>The export includes a CSV for overall part totals and an Excel workbook with overall totals, PO part totals, and extracted detail rows.</p>
+            <div class="controls">
+              <span class="button button-secondary">Choose PDF</span>
+              <span class="filename" id="filename">No file selected</span>
+            </div>
+            <input id="pdf-file" name="pdf_file" type="file" accept=".pdf,application/pdf">
+          </label>
+
+          <div class="field-row">
+            <label class="field">
+              <span>OCR DPI</span>
+              <input id="dpi" type="number" min="120" max="320" step="10" value="220">
+            </label>
+          </div>
+
+          <div class="controls controls-spaced">
+            <button class="button-primary" id="submit-button" type="submit">Process and Save</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="panel">
+        <div class="status" id="status">Choose a PDF to begin.</div>
+        <div class="progress-wrap">
+          <div class="progress-bar">
+            <div class="progress-fill" id="progress-fill"></div>
+          </div>
+          <p class="progress-text" id="progress-text"></p>
+        </div>
+      </div>
+
+      <div class="panel hidden" id="summary-panel">
+        <div class="summary-head">
+          <h2>Preview</h2>
+          <p id="summary-copy"></p>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Part Number</th>
+                <th>Total Qty Shipped</th>
+              </tr>
+            </thead>
+            <tbody id="summary-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <p class="footnote">
+        Best experience: Chromium-based browsers like Chrome or Edge, which support a native save dialog for the ZIP export. Other browsers will still download the ZIP normally.
+      </p>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
