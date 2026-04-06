@@ -3,7 +3,9 @@ import csv
 import re
 from collections import defaultdict
 from dataclasses import dataclass
+from io import BytesIO, StringIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import DefaultDict, Iterable, List
 
 import pandas as pd
@@ -11,11 +13,14 @@ import pytesseract
 from pdf2image import convert_from_path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_POPPLER_PATH = PROJECT_ROOT / "poppler" / "poppler-25.12.0" / "Library" / "bin"
-DEFAULT_TESSERACT_PATH = PROJECT_ROOT / "tesseract" / "tesseract.exe"
 PART_NUMBER_PATTERN = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+)+[A-Z0-9]*$")
 PART_NUMBER_SEARCH = re.compile(r"[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+[A-Z0-9]*")
+REPO_ROOT = Path(__file__).resolve().parent
+SEARCH_ROOTS = (
+    REPO_ROOT,
+    REPO_ROOT.parent,
+    REPO_ROOT.parent.parent,
+)
 
 
 @dataclass
@@ -26,6 +31,33 @@ class ShipmentRow:
     packing_slip: str
     part_number: str
     raw_line: str
+
+
+@dataclass
+class ReportArtifacts:
+    rows: List[ShipmentRow]
+    part_totals: DefaultDict[str, int]
+    po_part_totals: DefaultDict[tuple[str, str], int]
+    csv_bytes: bytes
+    excel_bytes: bytes
+
+
+def resolve_existing_path(candidates: Iterable[Path]) -> Path | None:
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def default_poppler_path() -> Path | None:
+    return resolve_existing_path(
+        root / "poppler" / "poppler-25.12.0" / "Library" / "bin"
+        for root in SEARCH_ROOTS
+    )
+
+
+def default_tesseract_path() -> Path | None:
+    return resolve_existing_path(root / "tesseract" / "tesseract.exe" for root in SEARCH_ROOTS)
 
 
 def configure_tesseract(tesseract_path: Path) -> None:
@@ -151,33 +183,26 @@ def aggregate_quantities_by_po(rows: Iterable[ShipmentRow]) -> DefaultDict[tuple
     return totals
 
 
-def write_csv(output_path: Path, totals: DefaultDict[str, int]) -> None:
-    with output_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["part_number", "total_qty_shipped"])
-        for part_number in sorted(totals):
-            writer.writerow([part_number, totals[part_number]])
-
-
-def write_excel(
-    output_path: Path,
-    rows: List[ShipmentRow],
-    part_totals: DefaultDict[str, int],
-    po_part_totals: DefaultDict[tuple[str, str], int],
-) -> None:
-    part_totals_frame = pd.DataFrame(
+def build_part_totals_frame(part_totals: DefaultDict[str, int]) -> pd.DataFrame:
+    return pd.DataFrame(
         [
             {"part_number": part_number, "total_qty_shipped": total}
             for part_number, total in sorted(part_totals.items())
         ]
     )
-    po_part_totals_frame = pd.DataFrame(
+
+
+def build_po_part_totals_frame(po_part_totals: DefaultDict[tuple[str, str], int]) -> pd.DataFrame:
+    return pd.DataFrame(
         [
             {"po_number": po_number, "part_number": part_number, "total_qty_shipped": total}
             for (po_number, part_number), total in sorted(po_part_totals.items())
         ]
     )
-    detail_frame = pd.DataFrame(
+
+
+def build_detail_frame(rows: List[ShipmentRow]) -> pd.DataFrame:
+    return pd.DataFrame(
         [
             {
                 "page_number": row.page_number,
@@ -191,10 +216,74 @@ def write_excel(
         ]
     )
 
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+
+def build_csv_bytes(part_totals: DefaultDict[str, int]) -> bytes:
+    buffer = StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["part_number", "total_qty_shipped"])
+    for part_number in sorted(part_totals):
+        writer.writerow([part_number, part_totals[part_number]])
+    return buffer.getvalue().encode("utf-8")
+
+
+def build_excel_bytes(
+    rows: List[ShipmentRow],
+    part_totals: DefaultDict[str, int],
+    po_part_totals: DefaultDict[tuple[str, str], int],
+) -> bytes:
+    part_totals_frame = build_part_totals_frame(part_totals)
+    po_part_totals_frame = build_po_part_totals_frame(po_part_totals)
+    detail_frame = build_detail_frame(rows)
+
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         part_totals_frame.to_excel(writer, sheet_name="Part Totals", index=False)
         po_part_totals_frame.to_excel(writer, sheet_name="PO Part Totals", index=False)
         detail_frame.to_excel(writer, sheet_name="Detail", index=False)
+    buffer.seek(0)
+    return buffer.read()
+
+
+def build_report_artifacts(pdf_path: Path, poppler_path: Path, tesseract_path: Path, dpi: int = 220) -> ReportArtifacts:
+    configure_tesseract(tesseract_path)
+
+    rows: List[ShipmentRow] = []
+    for page_number, text in enumerate(ocr_pdf(pdf_path, poppler_path, dpi), start=1):
+        rows.extend(extract_rows_from_text(text, page_number))
+
+    if not rows:
+        raise ValueError("No shipment rows were detected in the PDF.")
+
+    part_totals = aggregate_quantities(rows)
+    po_part_totals = aggregate_quantities_by_po(rows)
+    csv_bytes = build_csv_bytes(part_totals)
+    excel_bytes = build_excel_bytes(rows, part_totals, po_part_totals)
+    return ReportArtifacts(
+        rows=rows,
+        part_totals=part_totals,
+        po_part_totals=po_part_totals,
+        csv_bytes=csv_bytes,
+        excel_bytes=excel_bytes,
+    )
+
+
+def write_outputs(
+    pdf_path: Path,
+    output_path: Path,
+    excel_output_path: Path,
+    poppler_path: Path,
+    tesseract_path: Path,
+    dpi: int,
+) -> ReportArtifacts:
+    artifacts = build_report_artifacts(
+        pdf_path=pdf_path,
+        poppler_path=poppler_path,
+        tesseract_path=tesseract_path,
+        dpi=dpi,
+    )
+    output_path.write_bytes(artifacts.csv_bytes)
+    excel_output_path.write_bytes(artifacts.excel_bytes)
+    return artifacts
 
 
 def parse_args() -> argparse.Namespace:
@@ -213,13 +302,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dpi", type=int, default=220, help="OCR render DPI. Default: 220.")
     parser.add_argument(
         "--poppler-path",
-        default=str(DEFAULT_POPPLER_PATH),
-        help="Path to the Poppler bin folder.",
+        default="",
+        help="Path to the Poppler bin folder. If omitted, common local paths are checked.",
     )
     parser.add_argument(
         "--tesseract-path",
-        default=str(DEFAULT_TESSERACT_PATH),
-        help="Path to tesseract.exe.",
+        default="",
+        help="Path to tesseract.exe. If omitted, common local paths are checked.",
     )
     return parser.parse_args()
 
@@ -231,27 +320,16 @@ def main() -> int:
         print(f"PDF not found: {pdf_path}")
         return 1
 
-    poppler_path = Path(args.poppler_path)
-    tesseract_path = Path(args.tesseract_path)
-    if not poppler_path.exists():
-        print(f"Poppler path not found: {poppler_path}")
+    poppler_path = Path(args.poppler_path).expanduser().resolve() if args.poppler_path else default_poppler_path()
+    tesseract_path = Path(args.tesseract_path).expanduser().resolve() if args.tesseract_path else default_tesseract_path()
+
+    if poppler_path is None or not poppler_path.exists():
+        print("Poppler path not found. Pass --poppler-path or add a local poppler install.")
         return 1
-    if not tesseract_path.exists():
-        print(f"Tesseract path not found: {tesseract_path}")
-        return 1
-
-    configure_tesseract(tesseract_path)
-
-    rows: List[ShipmentRow] = []
-    for page_number, text in enumerate(ocr_pdf(pdf_path, poppler_path, args.dpi), start=1):
-        rows.extend(extract_rows_from_text(text, page_number))
-
-    if not rows:
-        print("No shipment rows were detected in the PDF.")
+    if tesseract_path is None or not tesseract_path.exists():
+        print("Tesseract path not found. Pass --tesseract-path or add a local tesseract install.")
         return 1
 
-    totals = aggregate_quantities(rows)
-    po_part_totals = aggregate_quantities_by_po(rows)
     output_path = (
         Path(args.output).expanduser().resolve()
         if args.output
@@ -262,15 +340,22 @@ def main() -> int:
         if args.excel_output
         else pdf_path.with_name(f"{pdf_path.stem}_part_totals.xlsx")
     )
-    write_csv(output_path, totals)
-    write_excel(excel_output_path, rows, totals, po_part_totals)
 
-    print(f"Rows detected: {len(rows)}")
-    print(f"Unique part numbers: {len(totals)}")
+    artifacts = write_outputs(
+        pdf_path=pdf_path,
+        output_path=output_path,
+        excel_output_path=excel_output_path,
+        poppler_path=poppler_path,
+        tesseract_path=tesseract_path,
+        dpi=args.dpi,
+    )
+
+    print(f"Rows detected: {len(artifacts.rows)}")
+    print(f"Unique part numbers: {len(artifacts.part_totals)}")
     print(f"Saved totals to: {output_path}")
     print(f"Saved Excel totals to: {excel_output_path}")
     print("\nTop totals:")
-    for part_number, total in sorted(totals.items(), key=lambda item: (-item[1], item[0]))[:15]:
+    for part_number, total in sorted(artifacts.part_totals.items(), key=lambda item: (-item[1], item[0]))[:15]:
         print(f"  {part_number}: {total}")
 
     return 0
